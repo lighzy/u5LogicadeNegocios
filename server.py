@@ -70,8 +70,9 @@ HTML_PAGE = """<!DOCTYPE html>
         button.secondary:hover { background: #334155; }
         
         .result-box { margin-top: 1rem; padding: 1rem; border-radius: 8px; font-size: 0.95rem; display: none; }
-        .result-box.success { background: #dcfce7; border: 1px solid #bbf7d0; color: #166534; display: block; }
-        .result-box.error { background: #fee2e2; border: 1px solid #fecaca; color: #991b1b; display: block; }
+        .result-box.success { background: #dcfce7; border: 1px solid #bbf7d0; color: #166534; display: block !important; }
+        .result-box.error { background: #fee2e2; border: 1px solid #fecaca; color: #991b1b; display: block !important; }
+        .result-box.info { background: #e0f2fe; border: 1px solid #bae6fd; color: #0369a1; display: block !important; }
         
         .full-width { grid-column: 1 / -1; }
         pre { background: #0f172a; color: #f8fafc; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: 0.85rem; max-height: 250px; }
@@ -164,9 +165,15 @@ HTML_PAGE = """<!DOCTYPE html>
     <script>
         document.getElementById('orderForm').addEventListener('submit', async (e) => {
             e.preventDefault();
+            const btn = e.target.querySelector('button[type="submit"]');
             const resBox = document.getElementById('orderResult');
-            resBox.className = 'result-box';
-            resBox.style.display = 'none';
+            const originalBtnText = btn.innerText;
+            btn.disabled = true;
+            btn.innerText = '⏳ Procesando checkout...';
+
+            resBox.className = 'result-box info';
+            resBox.style.display = 'block';
+            resBox.innerText = 'Ejecutando servicio de checkout...';
 
             const payload = {
                 total: parseFloat(document.getElementById('total').value),
@@ -182,30 +189,37 @@ HTML_PAGE = """<!DOCTYPE html>
                     body: JSON.stringify(payload)
                 });
                 const data = await response.json();
+                resBox.style.display = 'block';
                 if (data.ok) {
                     resBox.className = 'result-box success';
-                    resBox.innerHTML = `<strong>Éxito:</strong> ${data.message}<br>` +
-                        `<ul>` +
+                    resBox.innerHTML = `<strong>✅ Éxito:</strong> ${data.message}<br>` +
+                        `<ul style="margin-top: 0.5rem; padding-left: 1.25rem;">` +
                         `<li>ID Pedido: <b>#${data.order_id}</b></li>` +
                         `<li>Total original: $${data.total.toFixed(2)}</li>` +
-                        `<li>Descuento VIP aplicado: $${data.discount.toFixed(2)}</li>` +
+                        `<li>Descuento VIP (15%): -$${data.discount.toFixed(2)}</li>` +
                         `<li>Monto final cobrado: <b>$${data.final_amount.toFixed(2)}</b></li>` +
                         `<li>Estado: <b>${data.status}</b></li>` +
+                        `<li>Guardado en BD: <b>SqlOrderRepository (SQLite)</b></li>` +
                         `</ul>`;
                 } else {
                     resBox.className = 'result-box error';
-                    resBox.innerHTML = `<strong>Error de Lógica de Negocio:</strong> ${data.error}`;
+                    resBox.innerHTML = `<strong>❌ ${data.title || 'Error de Regla de Negocio'}:</strong><br>${data.error}` +
+                        (data.hint ? `<div style="margin-top: 0.5rem; font-size: 0.85rem; color: #7f1d1d;">💡 <b>Consejo:</b> ${data.hint}</div>` : '');
                 }
             } catch (err) {
                 resBox.className = 'result-box error';
-                resBox.innerText = 'Error al comunicarse con el servidor.';
+                resBox.style.display = 'block';
+                resBox.innerText = 'Error al comunicarse con el servidor: ' + err.message;
+            } finally {
+                btn.disabled = false;
+                btn.innerText = originalBtnText;
             }
         });
 
         document.getElementById('cancelForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const resBox = document.getElementById('cancelResult');
-            resBox.className = 'result-box';
+            resBox.style.display = 'block';
 
             const payload = {
                 status: document.getElementById('orderStatus').value,
@@ -221,15 +235,17 @@ HTML_PAGE = """<!DOCTYPE html>
                     body: JSON.stringify(payload)
                 });
                 const data = await response.json();
+                resBox.style.display = 'block';
                 if (data.can_cancel) {
                     resBox.className = 'result-box success';
-                    resBox.innerHTML = `<strong>Cancelación Permitida:</strong> ${data.reason}`;
+                    resBox.innerHTML = `<strong>✅ Cancelación Permitida:</strong><br>${data.reason}`;
                 } else {
                     resBox.className = 'result-box error';
-                    resBox.innerHTML = `<strong>Cancelación Denegada:</strong> ${data.reason}`;
+                    resBox.innerHTML = `<strong>🚫 Cancelación Denegada:</strong><br>${data.reason}`;
                 }
             } catch (err) {
                 resBox.className = 'result-box error';
+                resBox.style.display = 'block';
                 resBox.innerText = 'Error al consultar regla.';
             }
         });
@@ -320,10 +336,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 gateway = MockPaymentGateway(succeed=gateway_ok)
                 service = OrderService(gateway)
 
-                # Confirmar y cobrar
-                order.confirm(customer_debt=debt)
-                if not gateway.charge(order.total - order.discount):
-                    raise RuntimeError("payment rejected")
+                # Validar deuda previa si aplica
+                if debt > 0:
+                    order.confirm(customer_debt=debt)
+
+                # Ejecutar checkout a través del servicio de aplicación
+                final_amount = service.checkout(order)
 
                 # Guardar en repositorio
                 current_id = order_counter
@@ -340,17 +358,36 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     "total": order.total,
                     "vip": order.vip,
                     "discount": order.discount,
-                    "final_amount": order.total - order.discount,
+                    "final_amount": final_amount,
                     "status": order.status
                 })
             except CustomerHasDebt:
-                self._send_json({"ok": False, "error": "El cliente tiene deuda pendiente (outstanding debt). No se puede confirmar el pedido."}, status=400)
+                self._send_json({
+                    "ok": False,
+                    "title": "Regla de Negocio: Deuda Pendiente",
+                    "error": "El cliente tiene una deuda pendiente de ${:.2f} (CustomerHasDebt: outstanding debt).".format(debt),
+                    "hint": "Cambia la 'Deuda pendiente' a 0.00 para autorizar el pedido."
+                }, status=200)
             except ValueError as ve:
-                self._send_json({"ok": False, "error": str(ve)}, status=400)
+                self._send_json({
+                    "ok": False,
+                    "title": "Regla de Negocio: Validación Inválida",
+                    "error": f"Valor inválido: {str(ve)}",
+                    "hint": "Asegúrate de que el total sea mayor a 0 y el pedido no esté confirmado previamente."
+                }, status=200)
             except RuntimeError as re:
-                self._send_json({"ok": False, "error": f"Fallo en la pasarela de pagos: {str(re)}"}, status=400)
+                self._send_json({
+                    "ok": False,
+                    "title": "Fallo en Pasarela de Pago",
+                    "error": f"La pasarela de pago rechazó el cobro (RuntimeError: {str(re)}).",
+                    "hint": "Selecciona 'Aprobada (Simulación OK)' en el campo Pasarela de Pago para completar el checkout."
+                }, status=200)
             except Exception as e:
-                self._send_json({"ok": False, "error": f"Error inesperado: {str(e)}"}, status=500)
+                self._send_json({
+                    "ok": False,
+                    "title": "Error Inesperado",
+                    "error": f"Error: {str(e)}"
+                }, status=500)
 
         elif url.path == '/api/order/cancel-check':
             status = data.get('status', 'NEW')
